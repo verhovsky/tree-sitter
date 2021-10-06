@@ -8,8 +8,8 @@
 #include <wctype.h>
 
 // #define DEBUG_ANALYZE_QUERY
-// #define LOG(...) fprintf(stderr, __VA_ARGS__)
-#define LOG(...)
+#define LOG(...) fprintf(stderr, __VA_ARGS__)
+// #define LOG(...)
 
 #define MAX_STEP_CAPTURE_COUNT 3
 #define MAX_STATE_PREDECESSOR_COUNT 100
@@ -74,12 +74,14 @@ typedef struct {
   uint16_t alternative_index;
   uint16_t negated_field_list_id;
   bool contains_captures: 1;
+  bool is_named: 1;
   bool is_immediate: 1;
   bool is_last_child: 1;
   bool is_pass_through: 1;
   bool is_dead_end: 1;
   bool alternative_is_immediate: 1;
-  bool is_definite: 1;
+  bool pattern_guaranteed: 1;
+  bool parent_node_guaranteed: 1;
 } QueryStep;
 
 /*
@@ -279,7 +281,6 @@ static const TSQueryError PARENT_DONE = -1;
 static const uint16_t PATTERN_DONE_MARKER = UINT16_MAX;
 static const uint16_t NONE = UINT16_MAX;
 static const TSSymbol WILDCARD_SYMBOL = 0;
-static const TSSymbol NAMED_WILDCARD_SYMBOL = UINT16_MAX - 1;
 
 /**********
  * Stream
@@ -512,9 +513,10 @@ static QueryStep query_step__new(
     .negated_field_list_id = 0,
     .contains_captures = false,
     .is_last_child = false,
+    .is_named = false,
     .is_pass_through = false,
     .is_dead_end = false,
-    .is_definite = false,
+    .pattern_guaranteed = false,
     .is_immediate = is_immediate,
     .alternative_is_immediate = false,
   };
@@ -548,9 +550,14 @@ static void query_step__remove_capture(QueryStep *self, uint16_t capture_id) {
  * StatePredecessorMap
  **********************/
 
-static inline StatePredecessorMap state_predecessor_map_new(const TSLanguage *language) {
+static inline StatePredecessorMap state_predecessor_map_new(
+  const TSLanguage *language
+) {
   return (StatePredecessorMap) {
-    .contents = ts_calloc(language->state_count * (MAX_STATE_PREDECESSOR_COUNT + 1), sizeof(TSStateId)),
+    .contents = ts_calloc(
+      language->state_count * (MAX_STATE_PREDECESSOR_COUNT + 1),
+      sizeof(TSStateId)
+    ),
   };
 }
 
@@ -565,7 +572,10 @@ static inline void state_predecessor_map_add(
 ) {
   unsigned index = state * (MAX_STATE_PREDECESSOR_COUNT + 1);
   TSStateId *count = &self->contents[index];
-  if (*count == 0 || (*count < MAX_STATE_PREDECESSOR_COUNT && self->contents[index + *count] != predecessor)) {
+  if (
+    *count == 0 ||
+    (*count < MAX_STATE_PREDECESSOR_COUNT && self->contents[index + *count] != predecessor)
+  ) {
     (*count)++;
     self->contents[index + *count] = predecessor;
   }
@@ -754,7 +764,6 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       QueryStep *next_step = &self->steps.contents[i + 1];
       if (
         step->symbol != WILDCARD_SYMBOL &&
-        step->symbol != NAMED_WILDCARD_SYMBOL &&
         next_step->depth > step->depth &&
         next_step->depth != PATTERN_DONE_MARKER
       ) {
@@ -762,7 +771,8 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       }
     }
     if (step->depth > 0) {
-      step->is_definite = true;
+      step->pattern_guaranteed = true;
+      step->parent_node_guaranteed = true;
     }
   }
 
@@ -1132,10 +1142,13 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
             bool does_match = false;
             if (visible_symbol) {
               does_match = true;
-              if (step->symbol == NAMED_WILDCARD_SYMBOL) {
-                if (!self->language->symbol_metadata[visible_symbol].named) does_match = false;
-              } else if (step->symbol != WILDCARD_SYMBOL) {
-                if (step->symbol != visible_symbol) does_match = false;
+              if (step->symbol == WILDCARD_SYMBOL) {
+                if (
+                  step->is_named &&
+                  !self->language->symbol_metadata[visible_symbol].named
+                ) does_match = false;
+              } else if (step->symbol != visible_symbol) {
+                does_match = false;
               }
               if (step->field && step->field != field_id) {
                 does_match = false;
@@ -1246,7 +1259,8 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
         step->depth > parent_depth &&
         !step->is_dead_end
       ) {
-        step->is_definite = false;
+        step->parent_node_guaranteed = false;
+        step->pattern_guaranteed = false;
       }
     }
 
@@ -1258,7 +1272,8 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
           step->depth == PATTERN_DONE_MARKER
         ) break;
         if (!step->is_dead_end) {
-          step->is_definite = false;
+          step->parent_node_guaranteed = false;
+          step->pattern_guaranteed = false;
         }
       }
     }
@@ -1308,7 +1323,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
         unsigned index, exists;
         array_search_sorted_by(&predicate_capture_ids, , capture_id, &index, &exists);
         if (exists) {
-          step->is_definite = false;
+          step->pattern_guaranteed = false;
           break;
         }
       }
@@ -1325,7 +1340,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       // Determine if this step is definite or has definite alternatives.
       bool is_definite = false;
       for (;;) {
-        if (step->is_definite) {
+        if (step->pattern_guaranteed) {
           is_definite = true;
           break;
         }
@@ -1341,9 +1356,9 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
         if (
           !prev_step->is_dead_end &&
           prev_step->depth != PATTERN_DONE_MARKER &&
-          prev_step->is_definite
+          prev_step->pattern_guaranteed
         ) {
-          prev_step->is_definite = false;
+          prev_step->pattern_guaranteed = false;
           done = false;
         }
       }
@@ -1358,13 +1373,14 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
         printf("  %u: DONE\n", i);
       } else {
         printf(
-          "  %u: {symbol: %s, field: %s, is_definite: %d}\n",
+          "  %u: {symbol: %s, field: %s, parent_node_guaranteed: %d, pattern_guaranteed: %d}\n",
           i,
-          (step->symbol == WILDCARD_SYMBOL || step->symbol == NAMED_WILDCARD_SYMBOL)
+          (step->symbol == WILDCARD_SYMBOL)
             ? "ANY"
             : ts_language_symbol_name(self->language, step->symbol),
           (step->field ? ts_language_field_name_for_id(self->language, step->field) : "-"),
-          step->is_definite
+          step->parent_node_guaranteed,
+          step->pattern_guaranteed
         );
       }
     }
@@ -1728,15 +1744,8 @@ static TSQueryError ts_query__parse_pattern(
     else {
       TSSymbol symbol;
 
-      // TODO - remove.
-      // For temporary backward compatibility, handle '*' as a wildcard.
-      if (stream->next == '*') {
-        symbol = depth > 0 ? NAMED_WILDCARD_SYMBOL : WILDCARD_SYMBOL;
-        stream_advance(stream);
-      }
-
       // Parse a normal node name
-      else if (stream_is_ident_start(stream)) {
+      if (stream_is_ident_start(stream)) {
         const char *node_name = stream->input;
         stream_scan_identifier(stream);
         uint32_t length = stream->input - node_name;
@@ -1750,7 +1759,7 @@ static TSQueryError ts_query__parse_pattern(
 
         // Parse the wildcard symbol
         else if (length == 1 && node_name[0] == '_') {
-          symbol = depth > 0 ? NAMED_WILDCARD_SYMBOL : WILDCARD_SYMBOL;
+          symbol = WILDCARD_SYMBOL;
         }
 
         else {
@@ -1771,10 +1780,13 @@ static TSQueryError ts_query__parse_pattern(
 
       // Add a step for the node.
       array_push(&self->steps, query_step__new(symbol, depth, is_immediate));
+      QueryStep *step = array_back(&self->steps);
       if (ts_language_symbol_metadata(self->language, symbol).supertype) {
-        QueryStep *step = array_back(&self->steps);
         step->supertype_symbol = step->symbol;
-        step->symbol = NAMED_WILDCARD_SYMBOL;
+        step->symbol = WILDCARD_SYMBOL;
+      }
+      if (symbol == WILDCARD_SYMBOL) {
+        step->is_named = true;
       }
 
       stream_skip_whitespace(stream);
@@ -1789,7 +1801,6 @@ static TSQueryError ts_query__parse_pattern(
         stream_scan_identifier(stream);
         uint32_t length = stream->input - node_name;
 
-        QueryStep *step = array_back(&self->steps);
         step->symbol = ts_language_symbol_for_name(
           self->language,
           node_name,
@@ -1883,13 +1894,7 @@ static TSQueryError ts_query__parse_pattern(
   }
 
   // Parse a wildcard pattern
-  else if (
-    stream->next == '_' ||
-
-    // TODO remove.
-    // For temporary backward compatibility, handle '*' as a wildcard.
-    stream->next == '*'
-  ) {
+  else if (stream->next == '_') {
     stream_advance(stream);
     stream_skip_whitespace(stream);
 
@@ -2123,7 +2128,7 @@ TSQuery *ts_query_new(
       // then optimize the matching process by skipping matching the wildcard.
       // Later, during the matching process, the query cursor will check that
       // there is a parent node, and capture it if necessary.
-      if (step->symbol == WILDCARD_SYMBOL && step->depth == 0) {
+      if (step->symbol == WILDCARD_SYMBOL && step->depth == 0 && !step->field) {
         QueryStep *second_step = &self->steps.contents[start_step_index + 1];
         if (second_step->symbol != WILDCARD_SYMBOL && second_step->depth == 1) {
           wildcard_root_alternative_index = step->alternative_index;
@@ -2253,10 +2258,26 @@ bool ts_query_step_is_definite(
     step_index = step_offset->step_index;
   }
   if (step_index < self->steps.size) {
-    return self->steps.contents[step_index].is_definite;
+    return self->steps.contents[step_index].pattern_guaranteed;
   } else {
     return false;
   }
+}
+
+bool ts_query__step_has_fallible_child(
+  const TSQuery *self,
+  uint16_t step_index
+) {
+  QueryStep *step = &self->steps.contents[step_index];
+  if (step->parent_node_guaranteed) return false;
+  assert(step_index + 1 < self->steps.size);
+  QueryStep *next_step = &self->steps.contents[step_index + 1];
+  if (
+    next_step->depth == PATTERN_DONE_MARKER ||
+    next_step->depth <= step->depth ||
+    next_step->parent_node_guaranteed
+  ) return false;
+  return true;
 }
 
 void ts_query_disable_capture(
@@ -2382,7 +2403,7 @@ static bool ts_query_cursor__first_in_progress_capture(
   uint32_t *state_index,
   uint32_t *byte_offset,
   uint32_t *pattern_index,
-  bool *is_definite
+  bool *pattern_guaranteed
 ) {
   bool result = false;
   *state_index = UINT32_MAX;
@@ -2417,9 +2438,9 @@ static bool ts_query_cursor__first_in_progress_capture(
       (node_start_byte == *byte_offset && state->pattern_index < *pattern_index)
     ) {
       QueryStep *step = &self->query->steps.contents[state->step_index];
-      if (is_definite) {
-        *is_definite = step->is_definite;
-      } else if (step->is_definite) {
+      if (pattern_guaranteed) {
+        *pattern_guaranteed = step->pattern_guaranteed;
+      } else if (step->pattern_guaranteed) {
         continue;
       }
 
@@ -2536,12 +2557,13 @@ static void ts_query_cursor__add_state(
     QueryState *prev_state = &self->states.contents[index - 1];
     if (prev_state->start_depth < start_depth) break;
     if (prev_state->start_depth == start_depth) {
-      if (prev_state->pattern_index < pattern->pattern_index) break;
-      if (prev_state->pattern_index == pattern->pattern_index) {
-        // Avoid inserting an unnecessary duplicate state, which would be
-        // immediately pruned by the longest-match criteria.
-        if (prev_state->step_index == pattern->step_index) return;
-      }
+      // Avoid inserting an unnecessary duplicate state, which would be
+      // immediately pruned by the longest-match criteria.
+      if (
+        prev_state->pattern_index == pattern->pattern_index &&
+        prev_state->step_index == pattern->step_index
+      ) return;
+      if (prev_state->pattern_index <= pattern->pattern_index) break;
     }
     index--;
   }
@@ -2846,10 +2868,12 @@ static inline bool ts_query_cursor__advance(
         // Determine if this node matches this step of the pattern, and also
         // if this node can have later siblings that match this step of the
         // pattern.
-        bool node_does_match =
-          step->symbol == symbol ||
-          step->symbol == WILDCARD_SYMBOL ||
-          (step->symbol == NAMED_WILDCARD_SYMBOL && is_named);
+        bool node_does_match = false;
+        if (step->symbol == WILDCARD_SYMBOL) {
+          node_does_match = is_named || !step->is_named;
+        } else {
+          node_does_match = symbol == step->symbol;
+        }
         bool later_sibling_can_match = has_later_siblings;
         if ((step->is_immediate && is_named) || state->seeking_immediate_match) {
           later_sibling_can_match = false;
@@ -2916,15 +2940,20 @@ static inline bool ts_query_cursor__advance(
         // parent, then this query state cannot simply be updated in place. It must be
         // split into two states: one that matches this node, and one which skips over
         // this node, to preserve the possibility of matching later siblings.
-        if (later_sibling_can_match && (step->contains_captures || !step->is_definite)) {
-          if (ts_query_cursor__copy_state(self, &state)) {
-            LOG(
-              "  split state for capture. pattern:%u, step:%u\n",
-              state->pattern_index,
-              state->step_index
-            );
-            copy_count++;
-          }
+        if (
+          later_sibling_can_match &&
+          (
+            step->contains_captures ||
+            ts_query__step_has_fallible_child(self->query, state->step_index)
+          ) &&
+          ts_query_cursor__copy_state(self, &state)
+        ) {
+          LOG(
+            "  split state for capture. pattern:%u, step:%u\n",
+            state->pattern_index,
+            state->step_index
+          );
+          copy_count++;
         }
 
         // If this pattern started with a wildcard, such that the pattern map
@@ -2978,7 +3007,7 @@ static inline bool ts_query_cursor__advance(
         );
 
         QueryStep *next_step = &self->query->steps.contents[state->step_index];
-        if (stop_on_definite_step && next_step->is_definite) did_match = true;
+        if (stop_on_definite_step && next_step->pattern_guaranteed) did_match = true;
 
         // If this state's next step has an alternative step, then copy the state in order
         // to pursue both alternatives. The alternative step itself may have an alternative,
@@ -3089,7 +3118,7 @@ static inline bool ts_query_cursor__advance(
           }
         }
 
-        // If there the state is at the end of its pattern, remove it from the list
+        // If the state is at the end of its pattern, remove it from the list
         // of in-progress states and add it to the list of finished states.
         if (!did_remove) {
           LOG(

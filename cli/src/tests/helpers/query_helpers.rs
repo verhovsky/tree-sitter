@@ -1,7 +1,8 @@
 use rand::prelude::Rng;
-use std::fmt::Write;
+use std::{cmp::Ordering, fmt::Write};
 use tree_sitter::{Node, Tree, TreeCursor};
 
+#[derive(Debug)]
 pub struct Pattern {
     kind: Option<&'static str>,
     named: bool,
@@ -10,7 +11,7 @@ pub struct Pattern {
     children: Vec<Pattern>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Match<'a, 'tree> {
     pub captures: Vec<(&'a str, Node<'tree>)>,
     pub last_node: Node<'tree>,
@@ -30,7 +31,7 @@ impl Pattern {
         while cursor.goto_first_child_for_byte(byte_offset).is_some() {
             max_depth += 1;
         }
-        let depth = rng.gen_range(0..max_depth);
+        let depth = rng.gen_range(0..=max_depth);
         for _ in 0..depth {
             cursor.goto_parent();
         }
@@ -38,17 +39,23 @@ impl Pattern {
         // Build a pattern that matches that node.
         // Sometimes include subsequent siblings of the node.
         let mut roots = vec![Self::random_pattern_for_node(&mut cursor, rng)];
-        while cursor.goto_next_sibling() {
+        while roots.len() < 5 && cursor.goto_next_sibling() {
             if rng.gen_bool(0.2) {
                 roots.push(Self::random_pattern_for_node(&mut cursor, rng));
             }
         }
 
-        // Right now, it's not syntactically valid to have a parenthesized
-        // list of sibling patterns where the first pattern in the list has
-        // a field name.
         if roots.len() > 1 {
+            // In a parenthesized list of sibling patterns, the first
+            // sibling can't be an anonymous `_` wildcard.
+            if roots[0].kind == Some("_") && !roots[0].named {
+                return roots.pop().unwrap();
+            }
+
+            // In a parenthesized list of sibling patterns, the first
+            // sibling can't have a field name.
             roots[0].field = None;
+
             Self {
                 kind: None,
                 named: true,
@@ -63,10 +70,11 @@ impl Pattern {
 
     fn random_pattern_for_node(cursor: &mut TreeCursor, rng: &mut impl Rng) -> Self {
         let node = cursor.node();
+
         let (kind, named) = if rng.gen_bool(0.9) {
             (Some(node.kind()), node.is_named())
         } else {
-            (Some("_"), true)
+            (Some("_"), node.is_named() && rng.gen_bool(0.8))
         };
 
         let field = if rng.gen_bool(0.75) {
@@ -82,7 +90,7 @@ impl Pattern {
         };
 
         let mut children = Vec::new();
-        if cursor.goto_first_child() {
+        if named && cursor.goto_first_child() {
             let max_children = rng.gen_range(0..4);
             while cursor.goto_next_sibling() {
                 if rng.gen_bool(0.6) {
@@ -131,6 +139,8 @@ impl Pattern {
                 has_contents = true;
             }
             string.push(')');
+        } else if self.kind == Some("_") {
+            string.push('_');
         } else {
             write!(string, "\"{}\"", self.kind.unwrap().replace("\"", "\\\"")).unwrap();
         }
@@ -159,11 +169,19 @@ impl Pattern {
                 }
             }
         }
-        matches.sort_unstable_by_key(|mat| {
-            let range = mat.last_node.byte_range();
-            (range.start, -(range.end as isize))
+
+        matches.sort_unstable_by(|a, b| {
+            compare_depth_first(a.last_node, b.last_node).then_with(|| {
+                for (a, b) in a.captures.iter().zip(b.captures.iter()) {
+                    let cmp = compare_depth_first(a.1, b.1);
+                    if !cmp.is_eq() {
+                        return cmp;
+                    }
+                }
+                b.captures.len().cmp(&a.captures.len())
+            })
         });
-        matches.dedup_by(|a, b| a.captures == b.captures);
+
         matches
     }
 
@@ -171,64 +189,84 @@ impl Pattern {
         let node = cursor.node();
 
         // If a kind is specified, check that it matches the node.
-        if let Some(kind) = &self.kind {
-            if *kind != "_" && node.kind() != *kind || node.is_named() != self.named {
+        if let Some(kind) = self.kind {
+            if kind == "_" {
+                if self.named && !node.is_named() {
+                    return Vec::new();
+                }
+            } else if kind != node.kind() || self.named != node.is_named() {
                 return Vec::new();
             }
         }
 
         // If a field is specified, check that it matches the node.
-        if let Some(field) = &self.field {
-            if cursor.field_name() != Some(*field) {
+        if let Some(field) = self.field {
+            if cursor.field_name() != Some(field) {
                 return Vec::new();
             }
         }
 
-        let mut captures = Vec::new();
-        if let Some(name) = &self.capture {
-            captures.push((name.as_str(), node));
-        }
+        // Create a match for the current node.
         let mat = Match {
-            captures,
+            captures: if let Some(name) = &self.capture {
+                vec![(name.as_str(), node)]
+            } else {
+                Vec::new()
+            },
             last_node: node,
         };
 
+        // If there are no child patterns to match, then return this single match.
         if self.children.is_empty() {
             return vec![mat];
         }
 
         // Find every matching combination of child patterns and child nodes.
-        if !cursor.goto_first_child() {
-            return Vec::new();
-        }
-
-        let mut match_states = vec![(0, mat)];
-        let mut finished_matches = Vec::new();
-        loop {
-            let mut new_match_states = Vec::new();
-            for (pattern_index, mat) in &match_states {
-                let child_pattern = &self.children[*pattern_index];
-                let child_matches = child_pattern.match_node(cursor);
-                for child_match in child_matches {
-                    let mut combined_match = mat.clone();
-                    combined_match.last_node = child_match.last_node;
-                    combined_match
-                        .captures
-                        .extend_from_slice(&child_match.captures);
-                    if pattern_index + 1 < self.children.len() {
-                        new_match_states.push((*pattern_index + 1, combined_match));
-                    } else {
-                        finished_matches.push(combined_match);
+        let mut finished_matches = Vec::<Match>::new();
+        if cursor.goto_first_child() {
+            let mut match_states = vec![(0, mat)];
+            loop {
+                let mut new_match_states = Vec::new();
+                for (pattern_index, mat) in &match_states {
+                    let child_pattern = &self.children[*pattern_index];
+                    let child_matches = child_pattern.match_node(cursor);
+                    for child_match in child_matches {
+                        let mut combined_match = mat.clone();
+                        combined_match.last_node = child_match.last_node;
+                        combined_match
+                            .captures
+                            .extend_from_slice(&child_match.captures);
+                        if pattern_index + 1 < self.children.len() {
+                            new_match_states.push((*pattern_index + 1, combined_match));
+                        } else {
+                            let mut existing = false;
+                            for existing_match in finished_matches.iter_mut() {
+                                if existing_match.captures == combined_match.captures {
+                                    if child_pattern.capture.is_some() {
+                                        existing_match.last_node = combined_match.last_node;
+                                    }
+                                    existing = true;
+                                }
+                            }
+                            if !existing {
+                                finished_matches.push(combined_match);
+                            }
+                        }
                     }
                 }
+                match_states.extend_from_slice(&new_match_states);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
             }
-            match_states.extend_from_slice(&new_match_states);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+            cursor.goto_parent();
         }
-        cursor.goto_parent();
-
         finished_matches
     }
+}
+
+fn compare_depth_first(a: Node, b: Node) -> Ordering {
+    let a = a.byte_range();
+    let b = b.byte_range();
+    a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end))
 }
