@@ -300,7 +300,7 @@ static inline void ts_language_write_symbol_as_dot_string(
         fputs("\\n", f);
         break;
       case '\t':
-        fputs("\\n", f);
+        fputs("\\t", f);
         break;
       default:
         fputc(*c, f);
